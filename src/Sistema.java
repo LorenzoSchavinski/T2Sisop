@@ -424,11 +424,16 @@ public class Sistema {
 							break;
 
 						// Chamadas de sistema
+						
+
 						case SYSCALL:
-							sysCall.handle(); // <<<<< aqui desvia para rotina de chamada de sistema, no momento so
-												// temos IO
-							pc++;
+							pc++; 
+							sysCall.handle();    // pode bloquear
+							if (sysCall.blockedThisCall) {
+								cpuStop = true;  // sai do run(); escalonador já botou outro para rodar
+							}
 							break;
+
 
 						case STOP: // por enquanto, para execucao
 							if (!sysCall.stop()) {  // stop() agora devolve boolean
@@ -539,6 +544,12 @@ public class Sistema {
 	public class SysCallHandling {
     private HW hw;
     private GerenteProcessos gp; // setado depois
+	private DeviceConsole device;
+	public void setDevice(DeviceConsole d) { this.device = d; }
+
+	// flag para informar à CPU que a SYSCALL bloqueou o processo
+	public volatile boolean blockedThisCall = false;
+
 
     public SysCallHandling(HW _hw) { hw = _hw; }
     public void setGP(GerenteProcessos gp) { this.gp = gp; }
@@ -555,40 +566,29 @@ public class Sistema {
 		}
 
 	public void handle() {
-		boolean quiet = (continuousOn || isSchedulerAlive());   
+    blockedThisCall = false; // default
+    boolean quiet = (continuousOn || isSchedulerAlive());
 
-		if (!quiet) {
-			System.out.println("SYSCALL pars:  " + hw.cpu.reg[8] + " / " + hw.cpu.reg[9]);
-		}
+    if (hw.cpu.reg[8] == 1) {            // READ
+        int logicalAddr = hw.cpu.reg[9];
+        int pid = gp.running != null ? gp.running.pid : -1;
+        // enfileira no dispositivo (valor simulado 0 em modo quiet)
+       // device.enqueue(new IORequest(IORequest.Type.READ, pid, logicalAddr, quiet ? 0 : null));
+        gp.blockRunningForIO(new IORequest(IORequest.Type.READ, pid, logicalAddr, quiet ? 0 : null));
+        blockedThisCall = true;
 
-		if (hw.cpu.reg[8] == 1) {  // READ
-			int v;
-			if (quiet) {             // não bloqueia/sem log
-			v = 0;
-			} else {
-			System.out.print("IN: ");
-			try {
-				java.util.Scanner sc = new java.util.Scanner(System.in);
-				v = sc.nextInt();
-			} catch (Exception e) {
-				System.out.println("Leitura inválida; usando 0.");
-				v = 0;
-			}
-			}
-			int logicalAddr = hw.cpu.reg[9];
-			if (!hw.cpu.writeMemLogicaP(logicalAddr, v)) {
-			if (!quiet) System.out.println("END LOGICO INVALIDO na SYSCALL READ: " + logicalAddr);
-			}
+    } else if (hw.cpu.reg[8] == 2) {     // WRITE
+        int logicalAddr = hw.cpu.reg[9];
+        int pid = gp.running != null ? gp.running.pid : -1;
+       // device.enqueue(new IORequest(IORequest.Type.WRITE, pid, logicalAddr, null));
+        gp.blockRunningForIO(new IORequest(IORequest.Type.WRITE, pid, logicalAddr, null));
+        blockedThisCall = true;
 
-		} else if (hw.cpu.reg[8] == 2) { // WRITE
-			int logicalAddr = hw.cpu.reg[9];
-			int v = hw.cpu.readMemLogicaP(logicalAddr);
-			if (!quiet) System.out.println("OUT:   " + v);
+    } else {
+        if (!quiet) System.out.println("SYSCALL param inválido: r8=" + hw.cpu.reg[8] + " / r9=" + hw.cpu.reg[9]);
+    }
+}
 
-		} else {
-			if (!quiet) System.out.println("  PARAMETRO INVALIDO");
-		}
-		}
 
 
 }
@@ -680,18 +680,33 @@ private void loadProgramPaged(Word[] progImage) {
 
 	}
 
-	public class SO {
+		public class SO {
+		private final HW hw;
 		public InterruptHandling ih;
 		public SysCallHandling sc;
 		public Utilities utils;
+		private Thread devThread;
+		private DeviceConsole device;
 
 		public SO(HW hw) {
-			ih = new InterruptHandling(hw); // rotinas de tratamento de int
-			sc = new SysCallHandling(hw); // chamadas de sistema
+			this.hw = hw;
+			ih = new InterruptHandling(hw);
+			sc = new SysCallHandling(hw);
 			hw.cpu.setAddressOfHandlers(ih, sc);
 			utils = new Utilities(hw);
 		}
+
+		public void attachDevice(GerenteProcessos gp) {
+			device = new DeviceConsole(hw, gp);
+			sc.setDevice(device);
+			gp.setDevice(device);
+			devThread = new Thread(device, "device-console");
+			devThread.setDaemon(true);
+			devThread.start();
+		}
 	}
+
+
 	// -------------------------------------------------------------------------------------------------------
 	// ------------------- S I S T E M A
 	// --------------------------------------------------------------------
@@ -713,7 +728,7 @@ private void loadProgramPaged(Word[] progImage) {
 		so.ih.setGP(gp);
 		so.sc.setGP(gp);
 
-		
+		so.attachDevice(gp);
 	}
 
 	private Thread schedThread;
@@ -1158,7 +1173,7 @@ private void loadProgramPaged(Word[] progImage) {
 		};
 	}
 
-	public enum ProcState { NEW, READY, RUNNING, TERMINATED }
+	public enum ProcState { NEW, READY, RUNNING, BLOCKED, TERMINATED }
 
 	public class PCB {
     public final int pid;
@@ -1185,6 +1200,10 @@ private void loadProgramPaged(Word[] progImage) {
 		private final Utilities utils;
 		private final Programs progs;
 		private int nextPid = 1;
+		private final Deque<PCB> blockedQueue = new ArrayDeque<>();
+		private DeviceConsole device;             // setado pelo SO
+		public void setDevice(DeviceConsole d) { this.device = d; }
+
 
 		private final Map<Integer, PCB> procTable = new HashMap<>();
 		private final Deque<PCB> readyQueue = new ArrayDeque<>();
@@ -1206,11 +1225,38 @@ private void loadProgramPaged(Word[] progImage) {
 			}
 		}
 
+					// chamado quando um SYSCALL de IO deve bloquear o processo corrente
+		public synchronized void blockRunningForIO(IORequest req) {
+			if (running == null) return;
+			PCB cur = running;
+			// salva contexto do processo atual
+			hw.cpu.saveContext(cur);
+			cur.state = ProcState.BLOCKED;
+			blockedQueue.addLast(cur);
+			running = null;
+			hw.tabelaPaginasAtiva = null;   // sem processo ativo
+			// envia a requisição ao dispositivo
+			device.enqueue(req);
+			// já escolhe outro para rodar (se houver)
+			scheduleNext();
+		}
+
+		// chamado pelo dispositivo quando o IO do pid terminou
+		public synchronized void onIOComplete(int pid) {
+			PCB p = procTable.get(pid);
+			if (p != null && p.state == ProcState.BLOCKED) {
+				blockedQueue.remove(p);
+				p.state = ProcState.READY;
+				readyQueue.addLast(p);
+			}
+			// não preempta quem está rodando: apenas deixa o pronto na fila
+		}
+
+		// garantir um primeiro dispatch quando o escalonador contínuo liga
 		public synchronized void kick() {
-			if (running == null) {
-				scheduleNext();
-			}
-			}
+			if (running == null) { scheduleNext(); }
+		}
+
 
 
 		public synchronized void onProcessFault() {
@@ -1401,5 +1447,91 @@ private void loadProgramPaged(Word[] progImage) {
 			}
 		}
 	}
+
+	// tipo de pedido de IO
+public static class IORequest {
+    public enum Type { READ, WRITE }
+    public final Type type;
+    public final int pid;
+    public final int logicalAddr;
+    public final Integer valueIfAny; // opcional (p/ READ podemos usar valor simulado)
+
+    public IORequest(Type type, int pid, int logicalAddr, Integer valueIfAny) {
+        this.type = type; this.pid = pid; this.logicalAddr = logicalAddr; this.valueIfAny = valueIfAny;
+    }
+}
+
+// dispositivo de console: processa IO em paralelo à CPU
+public class DeviceConsole implements Runnable {
+    private final java.util.concurrent.BlockingQueue<IORequest> q = new java.util.concurrent.LinkedBlockingQueue<>();
+    private final HW hw;
+    private final GerenteProcessos gp;
+    private volatile boolean on = true;
+
+    public DeviceConsole(HW hw, GerenteProcessos gp) { this.hw = hw; this.gp = gp; }
+
+    public void enqueue(IORequest r) { q.offer(r); }
+
+    public void shutdown() { on = false; }
+
+    @Override public void run() {
+        while (on) {
+            try {
+                IORequest r = q.take();             // espera requisição
+                // simula tempo de IO
+                try { Thread.sleep(700); } catch (InterruptedException ignored) {}
+                if (r.type == IORequest.Type.READ) {
+                    // Valor simulado para evitar conflito com o teclado do shell
+                    int v = (r.valueIfAny != null ? r.valueIfAny : 0);
+                    dmaWrite(r.pid, r.logicalAddr, v);
+                } else { // WRITE
+                    int v = dmaRead(r.pid, r.logicalAddr);
+                    // imprime somente quando não estiver em modo "quiet"
+                    if (!(continuousOn || isSchedulerAlive())) {
+                        System.out.println("OUT:   " + v);
+                    }
+                }
+                // sinaliza conclusão do IO: processo vai para READY
+                gp.onIOComplete(r.pid);
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+    }
+
+    // "DMA" conceitual: traduz log->fis com a tabela do processo (sem depender da CPU ativa)
+    private int translateWith(PCB pcb, int logical) {
+        int tamPg = hw.gm.getTamPg();
+        int pagina = logical / tamPg;
+        int desloc = logical % tamPg;
+        if (pagina < 0 || pagina >= pcb.tabelaPaginas.length) return -1;
+        int frame = pcb.tabelaPaginas[pagina];
+        int fis = frame * tamPg + desloc;
+        if (fis < 0 || fis >= hw.mem.pos.length) return -1;
+        return fis;
+    }
+    private void dmaWrite(int pid, int logical, int value) {
+        PCB pcb = gp.procTable.get(pid);
+        if (pcb == null) return;
+        int fis = translateWith(pcb, logical);
+        if (fis >= 0) {
+            synchronized (hw.mem) {
+                hw.mem.pos[fis].p = value;
+            }
+        }
+    }
+    private int dmaRead(int pid, int logical) {
+        PCB pcb = gp.procTable.get(pid);
+        if (pcb == null) return 0;
+        int fis = translateWith(pcb, logical);
+        if (fis >= 0) {
+            synchronized (hw.mem) {
+                return hw.mem.pos[fis].p;
+            }
+        }
+        return 0;
+    }
+}
+
 
 }
