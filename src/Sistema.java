@@ -86,7 +86,7 @@ public class Sistema {
 	}
 
 	public enum Interrupts {           
-    noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow, intTimer;
+    noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow, intTimer, intPageFault;
 }
 
 
@@ -116,6 +116,9 @@ public class Sistema {
 
 		private int delta = 8;   // ajuste o quantum aqui
 		private int tick  = 0;
+		private int lastFaultAddr = -1;
+		public int consumeLastFaultAddr() { int a = lastFaultAddr; lastFaultAddr = -1; return a; }
+
 		
 
 		public CPU(Memory _mem, boolean _debug) { // ref a MEMORIA passada na criacao da CPU
@@ -162,8 +165,9 @@ public class Sistema {
 				return -1;
 			}
 			int frame = u.hw.tabelaPaginasAtiva[pagina];
-			if (frame < 0 || frame >= u.hw.gm.getNumFrames()) {
-				irpt = Interrupts.intEnderecoInvalido;
+			if (frame < 0) {
+				irpt = Interrupts.intPageFault;
+				lastFaultAddr = enderecoLogico;
 				return -1;
 			}
 			int enderecoFisico = frame * tamPg() + desloc;
@@ -1183,6 +1187,8 @@ private void loadProgramPaged(Word[] progImage) {
     public int[] tabelaPaginas;   // page -> frame
     public int tamProg;           // numero de palavras do programa
     public int[] regs = new int[10]; 
+	public boolean[] present;   // present[p] == true se a página p está em memória
+	public int[] diskSlot;      // -1 se nunca foi ao disco; >=0 se já está gravada em "disco"
 
     public PCB(int pid, String name, int[] tabela, int tamProg) {
         this.pid = pid;
@@ -1316,6 +1322,8 @@ private void loadProgramPaged(Word[] progImage) {
 			}
 			int tamProg = image.length;
 
+			int tamPg = hw.gm.getTamPg();
+			int numPages = (tamProg + tamPg - 1) / tamPg;
 			//  reserva espaço logico até 100.
 			int tamLogico = Math.max(tamProg, 100);
 			int[] tabela = hw.gm.aloca(tamLogico);
@@ -1323,6 +1331,11 @@ private void loadProgramPaged(Word[] progImage) {
 				System.out.println("Sem memória (frames) para alocar: " + progName);
 				return -1;
 			}
+
+
+
+			int[] tabela = new int[numPages];
+			java.util.Arrays.fill(tabela, -1);
 
 			copyProgramToFrames(tabela, image);
 
