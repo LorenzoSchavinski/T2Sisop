@@ -568,18 +568,14 @@ public class Sistema {
 
 			if (irpt == Interrupts.intTimer) {
 				gp.onTimeSlice();  // salva contexto do atual, coloca em READY e mete o proximo
-				if (continuousOn) {
-					return false;              // faz cpu.run() sair agora
-				} else {
-					return gp.hasRunnable();   // modo batch/exec: segue rodando
-				}
+				return false; 
 
 				
 
 
 			} else {
-				if (!continuousOn) {
-					System.out.println("Interrupcao " + irpt + " no PID " + (gp != null && gp.running != null ? gp.running.pid : -1));
+				if (!continuousOn && gp != null && gp.running != null) {
+					System.out.println("Interrupcao " + irpt + " no PID " + gp.running.pid);
 				}
 				if (gp != null && gp.running != null) {
 					gp.onProcessFault();
@@ -949,8 +945,8 @@ private void loadProgramPaged(Word[] progImage) {
 	// -------------------------------------------------------------------------------------------------------
 	// ------------------- instancia e testa sistema
 	public static void main(String args[]) {
-		//Sistema s = new Sistema(1024);
-		Sistema s = new Sistema(32);
+		Sistema s = new Sistema(1024);
+		//Sistema s = new Sistema(32);
 
 		s.run();
 	}
@@ -1691,26 +1687,81 @@ private void loadProgramPaged(Word[] progImage) {
 		}
 
 		// exec id do programa
-		public synchronized boolean exec(int pid) {
-			PCB pcb = procTable.get(pid);
-			if (pcb == null) { System.out.println("PID inexistente: " + pid); return false; }
-			if (running != null) { System.out.println("Já existe processo rodando: PID=" + running.pid); return false; }
-			readyQueue.removeIf(p -> p.pid == pid);
+		public boolean exec(int pid) {
+			PCB pcb;
+			synchronized (this) {
+				pcb = procTable.get(pid);
+				if (pcb == null) { System.out.println("PID inexistente: " + pid); return false; }
+				if (running != null) { System.out.println("Já existe processo rodando: PID=" + running.pid); return false; }
+				readyQueue.removeIf(p -> p.pid == pid);
+				dispatch(pcb);
+				System.out.println("---------------------------------- inicia execucao PID=" + pid);
+			}
 
-			dispatch(pcb);
-			System.out.println("---------------------------------- inicia execucao PID=" + pid);
-			hw.cpu.run(); // timer/stop mudarão o running e continuarão via handlers
-			System.out.println("---------------------------------- pausa/termino PID=" + pid);
+			while (true) {
+				synchronized (this) {
+					if (pcb.state == ProcState.TERMINATED) break;
+
+					if (running == null) {
+						if (!readyQueue.isEmpty()) {
+							scheduleNext();
+						} else {
+							// nada pronto agora -> libera lock e aguarda I/O/disk acordar alguém
+							// (não chame run() sem running!)
+						}
+					}
+				}
+
+				if (running == null) {
+					try { Thread.sleep(3); } catch (InterruptedException ignored) {}
+					continue;
+				}
+
+				hw.cpu.run(); // só é chamado quando existe running
+			}
+
+			System.out.println("---------------------------------- termino PID=" + pid);
 			return true;
 		}
-		public synchronized void execAll() {
-			while (hasRunnable()) {
-				if (running == null) scheduleNext();
-				if (running == null) break;
-				hw.cpu.run();
-			}
-			System.out.println("[execAll] Todos os processos finalizaram ou foram removidos.");
-		}
+
+
+public void execAll() {
+    System.out.println("[execAll] Iniciando...");
+    while (true) {
+        boolean shouldBreak = false;
+
+        synchronized (this) {
+            if (running == null) {
+                scheduleNext(); // tenta despachar um READY
+            }
+            // Se não há RUNNING nem READY:
+            if (running == null && readyQueue.isEmpty()) {
+                // 1) Se ainda há BLOQUEADOS, NÃO termina: aguarda I/O/disk acordar alguém
+                if (!blockedQueue.isEmpty()) {
+                    // segue fora do synchronized para dar oportunidade às interrupções
+                } else {
+                    // 2) Sem RUNNING, sem READY e sem BLOQUEADOS => acabou tudo
+                    shouldBreak = true;
+                }
+            }
+        }
+
+        if (shouldBreak) break;
+
+        if (running == null) {
+            try { Thread.sleep(3); } catch (InterruptedException ignored) {}
+            continue;
+        }
+
+        // Roda até STOP/fault/timer
+        hw.cpu.run();
+    }
+    System.out.println("[execAll] Todos os processos finalizaram ou foram removidos.");
+}
+
+
+
+
 
 
 
@@ -1781,7 +1832,8 @@ public class DeviceConsole implements Runnable {
                     }
                 }
                 // sinaliza conclusão do IO: processo vai para READY
-				hw.cpu.raiseIOComplete(r.pid);
+				gp.onIOComplete(r.pid);        // move BLOCKED -> READY imediatamente
+				hw.cpu.raiseIOComplete(r.pid); // (opcional) mantém a sinalização assíncrona
             } catch (InterruptedException e) {
                 break;
             }
@@ -1934,6 +1986,9 @@ public void run() {
                             hw.mem.pos[baseFis + off].p = dump[off];
                         }
                     }
+					gp.onPageLoaded(r.pid, r.page, r.frame);     // mapeia a página e põe o processo em READY
+					hw.cpu.raiseDiskPageLoaded(r.pid, r.page, r.frame); // (opcional) manter é inofensivo
+
                 }
 
                 hw.cpu.raiseDiskPageLoaded(r.pid, r.page, r.frame); // interrupção “página carregada”
