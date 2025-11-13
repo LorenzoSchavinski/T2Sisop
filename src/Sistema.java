@@ -86,8 +86,9 @@ public class Sistema {
 	}
 
 	public enum Interrupts {           
-    noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow, intTimer, intPageFault;
-}
+    noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow, intTimer, intPageFault,
+	intIOComplete, intDiskPageSaved, intDiskPageLoaded;}
+
 
 
 	public class CPU {
@@ -117,6 +118,23 @@ public class Sistema {
 		private int delta = 8;   // ajuste o quantum aqui
 		private int tick  = 0;
 		private int lastFaultAddr = -1;
+
+		private volatile int diskPid = -1, diskPage = -1, diskFrame = -1;
+		public void raiseDiskPageSaved(int frame) { this.diskFrame = frame; asyncIrpt.set(Interrupts.intDiskPageSaved); }
+		public void raiseDiskPageLoaded(int pid, int page, int frame) {
+			this.diskPid = pid; this.diskPage = page; this.diskFrame = frame;
+			asyncIrpt.set(Interrupts.intDiskPageLoaded);
+		}
+		public int consumeDiskFrame() { int f = diskFrame; diskFrame = -1; return f; }
+		public int[] consumeDiskLoad() { int[] a = {diskPid, diskPage, diskFrame}; diskPid = diskPage = diskFrame = -1; return a; }
+
+		private final java.util.concurrent.atomic.AtomicReference<Interrupts> asyncIrpt =
+		new java.util.concurrent.atomic.AtomicReference<>(Interrupts.noInterrupt);
+		private volatile int lastIOPid = -1;
+
+		public void raiseIOComplete(int pid) { lastIOPid = pid; asyncIrpt.set(Interrupts.intIOComplete); }
+		public int consumeLastIOPid() { int p = lastIOPid; lastIOPid = -1; return p; }
+
 		public int consumeLastFaultAddr() { int a = lastFaultAddr; lastFaultAddr = -1; return a; }
 
 		
@@ -461,6 +479,11 @@ public class Sistema {
 				}
 				// --------------------------------------------------------------------------------------------------
 				// VERIFICA INTERRUPÇÃO !!! - TERCEIRA FASE DO CICLO DE INSTRUÇÕES
+				Interrupts pend = asyncIrpt.getAndSet(Interrupts.noInterrupt);
+				if (pend != Interrupts.noInterrupt && irpt == Interrupts.noInterrupt) {
+					irpt = pend;
+				}
+				
 				if (irpt != Interrupts.noInterrupt) { // existe interrupção
 					boolean keepRunning = ih.handle(irpt); // handler agora retorna se a CPU deve continuar
 					irpt = Interrupts.noInterrupt;
@@ -517,15 +540,42 @@ public class Sistema {
 
    
 		public boolean handle(Interrupts irpt) {
+
+			if (irpt == Interrupts.intDiskPageSaved) {
+			hw.cpu.consumeDiskFrame();          // apenas consome; NÃO chamar hw.gm.requeue(frame) aqui
+			return gp.hasRunnable();
+		}
+
+		if (irpt == Interrupts.intDiskPageLoaded) {
+			int[] a = hw.cpu.consumeDiskLoad(); // pid,page,frame
+			gp.onPageLoaded(a[0], a[1], a[2]);  // mapeia & põe em READY
+			return gp.hasRunnable();
+		}
+
+
+			if (irpt == Interrupts.intIOComplete) {
+			int donePid = hw.cpu.consumeLastIOPid();
+			gp.onIOComplete(donePid);      // move de BLOCKED -> READY
+			return gp.hasRunnable();       // segue rodando quem estiver
+		}
+
+
+			if (irpt == Interrupts.intPageFault) {
+					int faultAddr = hw.cpu.consumeLastFaultAddr();
+					gp.onPageFault(faultAddr);   // vai bloquear o processo e disparar o page-in
+					return false;                // faz a CPU sair (outro pega a CPU)
+				}
+
 			if (irpt == Interrupts.intTimer) {
 				gp.onTimeSlice();  // salva contexto do atual, coloca em READY e mete o proximo
-
-				
 				if (continuousOn) {
 					return false;              // faz cpu.run() sair agora
 				} else {
 					return gp.hasRunnable();   // modo batch/exec: segue rodando
 				}
+
+				
+
 
 			} else {
 				if (!continuousOn) {
@@ -576,9 +626,14 @@ public class Sistema {
     if (hw.cpu.reg[8] == 1) {            // READ
         int logicalAddr = hw.cpu.reg[9];
         int pid = gp.running != null ? gp.running.pid : -1;
-        // enfileira no dispositivo (valor simulado 0 em modo quiet)
-       // device.enqueue(new IORequest(IORequest.Type.READ, pid, logicalAddr, quiet ? 0 : null));
-        gp.blockRunningForIO(new IORequest(IORequest.Type.READ, pid, logicalAddr, quiet ? 0 : null));
+
+		if (quiet) {
+            // modo contínuo: simula valor 0 e segue via device
+            gp.blockRunningForIO(new IORequest(IORequest.Type.READ, pid, logicalAddr, 0));
+        } else {
+            gp.blockRunningForPendingRead(pid, logicalAddr);
+            Sistema.this.setPendingRead(pid, logicalAddr);
+        }
         blockedThisCall = true;
 
     } else if (hw.cpu.reg[8] == 2) {     // WRITE
@@ -733,10 +788,21 @@ private void loadProgramPaged(Word[] progImage) {
 		so.sc.setGP(gp);
 
 		so.attachDevice(gp);
+
+		DiskDevice disk = new DiskDevice(this, hw, progs, gp);
+		Thread diskT = new Thread(disk, "device-disk");
+		diskT.setDaemon(true);
+		diskT.start();
+		gp.setDisk(disk);
+
 	}
 
 	private Thread schedThread;
   private volatile boolean continuousOn = false;
+	private final java.util.Map<String, int[]> disk = new java.util.HashMap<>();
+	private String key(int pid, int page){ return pid+":"+page; }
+	private void diskSave(int pid, int page, int[] data){ disk.put(key(pid,page), data); }
+	private int[] diskLoad(int pid, int page){ return disk.get(key(pid,page)); }
 
   private void startContinuous() {
     if (schedThread != null && schedThread.isAlive()) {
@@ -790,80 +856,102 @@ private void loadProgramPaged(Word[] progImage) {
 	public void run() {
 	System.out.println("SO pronto. Comandos: new <prog> | rm <pid> | ps | dump <pid> | dumpM <ini> <fim> | exec <pid> | execAll | traceOn | traceOff | go | halt | exit");
 	Scanner sc = new Scanner(System.in);
-	while (true) {
+		while (true) {
+		// Se há leitura pendente, NÃO interpretar comandos; pedir um inteiro
+		if (pendingRead != null) {
+			PendingRead pr = pendingRead; // só para mostrar no prompt
+			System.out.print("IN (pid=" + pr.pid + ", addr=" + pr.addr + ") > ");
+			if (!sc.hasNext()) break;
+
+			if (sc.hasNextInt()) {
+				int v = sc.nextInt();
+				// grava e desbloqueia o processo
+				gp.writeLogicalForPid(pr.pid, pr.addr, v);
+				getAndClearPendingRead();
+			} else {
+				// consome token inválido e avisa
+				String junk = sc.next();
+				System.out.println("Entrada inválida. Digite um inteiro.");
+			}
+			continue; // volta ao loop sem processar comandos
+		}
+
+		// Modo normal (sem leitura pendente): interpreta comandos do SO
 		System.out.print("> ");
 		if (!sc.hasNext()) break;
 		String cmd = sc.next();
 
 		if (cmd.equalsIgnoreCase("new")) {
-		String prog = sc.next();
-		gp.newProcess(prog);           // em modo contínuo, o timer preempta e pega sozinho
+			String prog = sc.next();
+			gp.newProcess(prog);
 
 		} else if (cmd.equalsIgnoreCase("rm")) {
-		int pid = sc.nextInt();
-		gp.rm(pid);
+			int pid = sc.nextInt();
+			gp.rm(pid);
 
 		} else if (cmd.equalsIgnoreCase("ps")) {
-		gp.ps();
+			gp.ps();
 
 		} else if (cmd.equalsIgnoreCase("dump")) {
-		int pid = sc.nextInt();
-		gp.dump(pid);
+			int pid = sc.nextInt();
+			gp.dump(pid);
 
 		} else if (cmd.equalsIgnoreCase("dumpM")) {
-		int ini = sc.nextInt();
-		int fim = sc.nextInt();
-		gp.dumpM(ini, fim);
+			int ini = sc.nextInt();
+			int fim = sc.nextInt();
+			gp.dumpM(ini, fim);
 
 		} else if (cmd.equalsIgnoreCase("exec")) {
-		int pid = sc.nextInt();
-		if (continuousOn) {
-			System.out.println("[WARN] Modo contínuo ON: ignore 'exec'. O escalonador já está rodando.");
-		} else {
-			gp.exec(pid); // modo batch: bloqueia ate pausar/terminar
-		}
+			int pid = sc.nextInt();
+			if (continuousOn) {
+				System.out.println("[WARN] Modo contínuo ON: ignore 'exec'. O escalonador já está rodando.");
+			} else {
+				gp.exec(pid);
+			}
 
 		} else if (cmd.equalsIgnoreCase("execAll")) {
-		if (continuousOn) {
-			System.out.println("[WARN] Modo contínuo ON: ignore 'execAll'. Use 'halt' para voltar ao modo batch.");
-		} else {
-			gp.execAll();  // roda tudo e volta
-		}
+			if (continuousOn) {
+				System.out.println("[WARN] Modo contínuo ON: ignore 'execAll'. Use 'halt' para voltar ao modo batch.");
+			} else {
+				gp.execAll();
+			}
 
 		} else if (cmd.equalsIgnoreCase("traceOn")) {
-		gp.setTrace(true);
+			gp.setTrace(true);
 
 		} else if (cmd.equalsIgnoreCase("traceOff")) {
-		gp.setTrace(false);
+			gp.setTrace(false);
 
 		} else if (cmd.equalsIgnoreCase("go")) {
-		startContinuous();
+			startContinuous();
 
 		} else if (cmd.equalsIgnoreCase("halt")) {
-		stopContinuous();
+			stopContinuous();
 
 		} else if (cmd.equalsIgnoreCase("exit")) {
-		stopContinuous();   // garante desligar a thread
-		System.out.println("Encerrando SO.");
-		break;
+			stopContinuous();
+			System.out.println("Encerrando SO.");
+			break;
 
 		} else {
-		System.out.println("Comando inválido.");
-		sc.nextLine();
+			System.out.println("Comando inválido.");
+			sc.nextLine();
 		}
 	}
 	sc.close();
-	}
+
+		}
 
 
 	// ------------------- S I S T E M A - fim
 	// --------------------------------------------------------------
-	// -------------------------------------------------------------------------------------------------------
-
+	// ------------------------------------------------------------------------------------------------------/
 	// -------------------------------------------------------------------------------------------------------
 	// ------------------- instancia e testa sistema
 	public static void main(String args[]) {
-		Sistema s = new Sistema(1024);
+		//Sistema s = new Sistema(1024);
+		Sistema s = new Sistema(32);
+
 		s.run();
 	}
 
@@ -1209,6 +1297,9 @@ private void loadProgramPaged(Word[] progImage) {
 		private final Deque<PCB> blockedQueue = new ArrayDeque<>();
 		private DeviceConsole device;             // setado pelo SO
 		public void setDevice(DeviceConsole d) { this.device = d; }
+		private DiskDevice disk;
+		public void setDisk(DiskDevice d) { this.disk = d; }
+		synchronized PCB getPCB(int pid) { return procTable.get(pid); }
 
 
 		private final Map<Integer, PCB> procTable = new HashMap<>();
@@ -1230,6 +1321,51 @@ private void loadProgramPaged(Word[] progImage) {
 				hw.tabelaPaginasAtiva = null;    // sem processo ativo
 			}
 		}
+
+		public synchronized void onPageLoaded(int pid, int page, int frame) {
+			PCB p = procTable.get(pid);
+			if (p == null) return;
+			p.tabelaPaginas[page] = frame;
+			p.present[page] = true;
+			hw.gm.setOwner(frame, pid, page);
+			hw.gm.touch(frame);
+			if (p.state == ProcState.BLOCKED) {
+				blockedQueue.remove(p);
+				p.state = ProcState.READY;
+				readyQueue.addLast(p);
+			}
+		}
+
+
+				// Bloqueia o processo corrente aguardando número do usuário (sem enfileirar em device)
+		public synchronized void blockRunningForPendingRead(int pid, int logicalAddr) {
+			if (running == null || running.pid != pid) return;
+			PCB cur = running;
+			hw.cpu.saveContext(cur);
+			cur.state = ProcState.BLOCKED;
+			blockedQueue.addLast(cur);
+			running = null;
+			hw.tabelaPaginasAtiva = null;
+			// agenda outro se houver
+			scheduleNext();
+		}
+
+		// Escreve valor no endereço lógico do PID e "completa" o IO (desbloqueia)
+		public synchronized void writeLogicalForPid(int pid, int logical, int value) {
+			PCB pcb = procTable.get(pid);
+			if (pcb == null) return;
+			int tamPg = hw.gm.getTamPg();
+			int page  = logical / tamPg;
+			pageInForIO(pcb, page); // garante página mapeada
+
+			int frame = pcb.tabelaPaginas[page];
+			int fis   = frame * tamPg + (logical % tamPg);
+			synchronized (hw.mem) { hw.mem.pos[fis].p = value; }
+
+			// sinaliza término do "IO" para esse processo
+			onIOComplete(pid);
+		}
+
 
 					// chamado quando um SYSCALL de IO deve bloquear o processo corrente
 		public synchronized void blockRunningForIO(IORequest req) {
@@ -1262,6 +1398,110 @@ private void loadProgramPaged(Word[] progImage) {
 		public synchronized void kick() {
 			if (running == null) { scheduleNext(); }
 		}
+
+		public void pageInForIO(PCB pcb, int page) {
+			if (page < 0 || page >= pcb.tabelaPaginas.length) return;
+			if (pcb.tabelaPaginas[page] >= 0) return; // já presente
+
+			int frame = hw.gm.allocFrame();
+			if (frame < 0) {
+				int victimFrame = hw.gm.pickVictimFIFO();
+				if (victimFrame < 0) return;
+
+				GerenteMemoria.FrameOwner fo = hw.gm.getOwner(victimFrame);
+				PCB vpcb = procTable.get(fo.pid);
+				int vpage = fo.page;
+
+				int tamPg = hw.gm.getTamPg();
+				int baseFisVic = victimFrame * tamPg;
+				int[] dump = new int[tamPg];
+				for (int off = 0; off < tamPg; off++) dump[off] = hw.mem.pos[baseFisVic + off].p;
+				diskSave(vpcb.pid, vpage, dump);
+				vpcb.present[vpage] = false;
+				vpcb.tabelaPaginas[vpage] = -1;
+
+				frame = victimFrame;
+				hw.gm.requeue(frame);
+			}
+
+			// carrega da imagem…
+			int tamPg = hw.gm.getTamPg();
+			int baseProg = page * tamPg;
+			int baseFis  = frame * tamPg;
+			Word[] image = progs.retrieveProgram(pcb.name);
+			for (int off = 0; off < tamPg; off++) {
+				int idx = baseProg + off;
+				if (idx < pcb.tamProg) {
+					hw.mem.pos[baseFis + off].opc = image[idx].opc;
+					hw.mem.pos[baseFis + off].ra  = image[idx].ra;
+					hw.mem.pos[baseFis + off].rb  = image[idx].rb;
+					hw.mem.pos[baseFis + off].p   = image[idx].p;
+				} else {
+					hw.mem.pos[baseFis + off].opc = Opcode.DATA;
+					hw.mem.pos[baseFis + off].ra  = -1;
+					hw.mem.pos[baseFis + off].rb  = -1;
+					hw.mem.pos[baseFis + off].p   = -1;
+				}
+			}
+			// …e re-aplica dump de “disco”, se houver
+			int[] dump = diskLoad(pcb.pid, page);
+			if (dump != null) {
+				for (int off = 0; off < tamPg; off++) hw.mem.pos[baseFis + off].p = dump[off];
+			}
+
+			pcb.tabelaPaginas[page] = frame;
+			pcb.present[page] = true;
+			hw.gm.setOwner(frame, pcb.pid, page);
+		}
+
+
+		public synchronized void onPageFault(int logicalAddr) {
+    if (running == null) return;
+
+    PCB cur = running;
+    int tamPg = hw.gm.getTamPg();
+    int page  = logicalAddr / tamPg;
+
+    // 1) Salva contexto do processo atual e BLOQUEIA
+    hw.cpu.saveContext(cur);
+    cur.state = ProcState.BLOCKED;
+    blockedQueue.addLast(cur);
+    running = null;
+    hw.tabelaPaginasAtiva = null;
+
+    // 2) Tenta frame livre
+    int frame = hw.gm.allocFrame();
+
+    if (frame < 0) {
+        // 3) Sem frame livre → escolhe vítima FIFO
+        int victimFrame = hw.gm.pickVictimFIFO();
+        if (victimFrame < 0) {
+            System.out.println("[PF] sem frame/vítima disponível para PID=" + cur.pid);
+            scheduleNext();
+            return;
+        }
+
+        GerenteMemoria.FrameOwner fo = hw.gm.getOwner(victimFrame);
+        PCB vpcb = procTable.get(fo.pid);
+        int vpage = fo.page;
+
+        System.out.println("[PF] PID=" + cur.pid + " faltou pag=" + page +
+                           " | vítima frame=" + victimFrame + " (PID=" + vpcb.pid + ", pag=" + vpage + ")");
+
+        vpcb.present[vpage]        = false;
+        vpcb.tabelaPaginas[vpage]  = -1;
+        vpcb.diskSlot[vpage]       = 1;   // marca que já foi ao "disco" ao menos uma vez
+
+        
+        disk.enqueue(new DiskDevice.Req(DiskDevice.Req.Type.SAVE, -1, -1, victimFrame, vpcb.pid, vpage));
+        disk.enqueue(new DiskDevice.Req(DiskDevice.Req.Type.LOAD, cur.pid, page, victimFrame, -1, -1));
+
+    } else {
+        disk.enqueue(new DiskDevice.Req(DiskDevice.Req.Type.LOAD, cur.pid, page, frame, -1, -1));
+    }
+
+    scheduleNext();
+}
 
 
 
@@ -1315,40 +1555,74 @@ private void loadProgramPaged(Word[] progImage) {
 
 		// new nome do pgrograma
 		public synchronized int newProcess(String progName) {
-			Word[] image = progs.retrieveProgram(progName);
-			if (image == null) {
-				System.out.println("Programa não encontrado: " + progName);
-				return -1;
-			}
-			int tamProg = image.length;
-
-			int tamPg = hw.gm.getTamPg();
-			int numPages = (tamProg + tamPg - 1) / tamPg;
-			//  reserva espaço logico até 100.
-			int tamLogico = Math.max(tamProg, 100);
-			int[] tabela = hw.gm.aloca(tamLogico);
-			if (tabela == null) {
-				System.out.println("Sem memória (frames) para alocar: " + progName);
-				return -1;
-			}
-
-
-
-			int[] tabela = new int[numPages];
-			java.util.Arrays.fill(tabela, -1);
-
-			copyProgramToFrames(tabela, image);
-
-			int pid = nextPid++;
-			PCB pcb = new PCB(pid, progName, tabela, tamProg);
-			pcb.state = ProcState.READY;
-			procTable.put(pid, pcb);
-			readyQueue.addLast(pcb);
-
-			System.out.println("Processo criado: PID=" + pid + "  Prog=" + progName +
-					"  Pags=" + tabela.length + "  Frames=" + java.util.Arrays.toString(tabela));
-			return pid;
+		// 1) Busca a "imagem" do programa (somente para montar a página 0 agora)
+		Word[] image = progs.retrieveProgram(progName);
+		if (image == null) {
+			System.out.println("Programa não encontrado: " + progName);
+			return -1;
 		}
+		int tamProg = image.length;
+
+		// 2) Tamanho de página e nº de páginas lógicas (reservamos espaço lógico mínimo)
+		int tamPg = hw.gm.getTamPg();
+		int tamLogico = Math.max(tamProg, 100);              // mantém uma folga lógica como no T1
+		int numPages = (tamLogico + tamPg - 1) / tamPg;
+
+		// 3) Tabela de páginas inicia toda **não presente** (-1)
+		int[] tabela = new int[numPages];
+		java.util.Arrays.fill(tabela, -1);
+
+		// 4) Aloca **um** frame para a página 0
+		int f0 = hw.gm.allocFrame();                         // << requer método allocFrame() no GerenteMemoria
+		if (f0 < 0) {
+			System.out.println("Sem frame livre para pagina 0: " + progName);
+			return -1;
+		}
+		tabela[0] = f0;
+
+		// (opcional, mas recomendado para replacement) registra dono do frame
+		try { hw.gm.setOwner(f0, nextPid, 0); } catch (Throwable ignore) {}
+
+		// 5) Copia **apenas a página 0** da imagem para o frame f0
+		int baseFis = f0 * tamPg;
+		for (int off = 0; off < tamPg; off++) {
+			int idx = off;                                   // página 0 => baseProg = 0
+			if (idx < tamProg) {
+				hw.mem.pos[baseFis + off].opc = image[idx].opc;
+				hw.mem.pos[baseFis + off].ra  = image[idx].ra;
+				hw.mem.pos[baseFis + off].rb  = image[idx].rb;
+				hw.mem.pos[baseFis + off].p   = image[idx].p;
+			} else {
+				// fora da imagem do programa: preenche como dado "vazio"
+				hw.mem.pos[baseFis + off].opc = Opcode.DATA;
+				hw.mem.pos[baseFis + off].ra  = -1;
+				hw.mem.pos[baseFis + off].rb  = -1;
+				hw.mem.pos[baseFis + off].p   = -1;
+			}
+		}
+
+		// 6) Cria o PCB (PC lógico inicia em 0, como no T1)
+		int pid = nextPid++;
+		PCB pcb = new PCB(pid, progName, tabela, tamProg);
+
+		// 7) Flags de presença / “slot de disco” (Parte B)
+		//    (garanta que PCB tenha estes campos: boolean[] present; int[] diskSlot;)
+		pcb.present  = new boolean[numPages];
+		pcb.diskSlot = new int[numPages];
+		java.util.Arrays.fill(pcb.diskSlot, -1);
+		pcb.present[0] = true;                               // só a página 0 está presente
+
+		// 8) Estado inicial e enfileiramento
+		pcb.state = ProcState.READY;
+		procTable.put(pid, pcb);
+		readyQueue.addLast(pcb);
+
+		System.out.println("Processo criado: PID=" + pid + "  Prog=" + progName +
+				"  Pags=" + numPages + "  Frames=" + java.util.Arrays.toString(tabela));
+
+		return pid;
+	}
+
 
 		// rm id do programa
 		public synchronized boolean rm(int pid) {
@@ -1362,6 +1636,7 @@ private void loadProgramPaged(Word[] progImage) {
 				return false;
 			}
 			readyQueue.removeIf(p -> p.pid == pid);
+			blockedQueue.removeIf(p -> p.pid == pid);
 			hw.gm.desaloca(pcb.tabelaPaginas);
 			procTable.remove(pid);
 			System.out.println("Processo removido: PID=" + pid + " (" + pcb.name + ")");
@@ -1403,6 +1678,7 @@ private void loadProgramPaged(Word[] progImage) {
 			int tamPg = hw.gm.getTamPg();
 			System.out.println("Dump memória física por frame:");
 			for (int frame : pcb.tabelaPaginas) {
+				if (frame < 0) continue;
 				int base = frame * tamPg;
 				System.out.println("Frame " + frame + " (físico " + base + " .. " + (base + tamPg - 1) + "):");
 				utils.dump(base, base + tamPg);
@@ -1505,12 +1781,42 @@ public class DeviceConsole implements Runnable {
                     }
                 }
                 // sinaliza conclusão do IO: processo vai para READY
-                gp.onIOComplete(r.pid);
+				hw.cpu.raiseIOComplete(r.pid);
             } catch (InterruptedException e) {
                 break;
             }
         }
     }
+
+	private void ensureMappedForIO(int pid, int logical) {
+    PCB pcb = gp.getPCB(pid);
+    if (pcb == null) return;
+    int tamPg = hw.gm.getTamPg();
+    int page  = logical / tamPg;
+    gp.pageInForIO(pcb, page);   // mapeia se necessário
+}
+
+private void dmaWrite(int pid, int logical, int value) {
+    PCB pcb = gp.getPCB(pid);
+    if (pcb == null) return;
+    ensureMappedForIO(pid, logical);
+    int fis = translateWith(pcb, logical);
+    if (fis >= 0) {
+        synchronized (hw.mem) { hw.mem.pos[fis].p = value; }
+    }
+}
+
+private int dmaRead(int pid, int logical) {
+    PCB pcb = gp.getPCB(pid);
+    if (pcb == null) return 0;
+    ensureMappedForIO(pid, logical);
+    int fis = translateWith(pcb, logical);
+    if (fis >= 0) {
+        synchronized (hw.mem) { return hw.mem.pos[fis].p; }
+    }
+    return 0;
+}
+
 
     // "DMA" conceitual: traduz log->fis com a tabela do processo (sem depender da CPU ativa)
     private int translateWith(PCB pcb, int logical) {
@@ -1523,28 +1829,121 @@ public class DeviceConsole implements Runnable {
         if (fis < 0 || fis >= hw.mem.pos.length) return -1;
         return fis;
     }
-    private void dmaWrite(int pid, int logical, int value) {
-        PCB pcb = gp.procTable.get(pid);
-        if (pcb == null) return;
-        int fis = translateWith(pcb, logical);
-        if (fis >= 0) {
-            synchronized (hw.mem) {
-                hw.mem.pos[fis].p = value;
-            }
+   
+}
+
+	// === INPUT INTERATIVO: controle de leitura pendente ===
+	private static class PendingRead {
+		final int pid;
+		final int addr;
+		PendingRead(int pid, int addr) { this.pid = pid; this.addr = addr; }
+	}
+	private volatile PendingRead pendingRead = null;
+
+	private synchronized void setPendingRead(int pid, int addr) {
+		this.pendingRead = new PendingRead(pid, addr);
+	}
+	private synchronized PendingRead getAndClearPendingRead() {
+		PendingRead pr = this.pendingRead;
+		this.pendingRead = null;
+		return pr;
+	}
+
+
+	public static class DiskDevice implements Runnable {
+		
+		private final java.util.concurrent.BlockingQueue<Req> q = new java.util.concurrent.LinkedBlockingQueue<>();
+		private final HW hw;
+		private final Programs progs;
+		private final GerenteProcessos gp;
+		private final Sistema outer; // para usar diskSave/diskLoad do Sistema
+		public DiskDevice(Sistema outer, HW hw, Programs progs, GerenteProcessos gp) {
+				this.outer = outer;
+				this.hw = hw;
+				this.progs = progs;
+				this.gp = gp;
+			}
+
+			 public static class Req {
+        enum Type { SAVE, LOAD }
+        final Type type;
+        final int pid, page, frame;        // para LOAD
+        final int victimPid, victimPage;   // para SAVE
+        Req(Type t, int pid, int page, int frame, int vpid, int vpage) {
+            this.type = t; this.pid = pid; this.page = page; this.frame = frame;
+            this.victimPid = vpid; this.victimPage = vpage;
         }
     }
-    private int dmaRead(int pid, int logical) {
-        PCB pcb = gp.procTable.get(pid);
-        if (pcb == null) return 0;
-        int fis = translateWith(pcb, logical);
-        if (fis >= 0) {
-            synchronized (hw.mem) {
-                return hw.mem.pos[fis].p;
+
+		public void enqueue(Req r) { q.offer(r); }
+
+		@Override
+public void run() {
+    while (true) {
+        try {
+            Req r = q.take();
+            try { Thread.sleep(300); } catch (InterruptedException ignored) {}
+
+            int tamPg = hw.gm.getTamPg();
+
+            if (r.type == Req.Type.SAVE) {
+                // dump DATA (p) do frame para “disco”
+                int base = r.frame * tamPg;
+                int[] dump = new int[tamPg];
+                synchronized (hw.mem) {
+                    for (int off = 0; off < tamPg; off++) {
+                        dump[off] = hw.mem.pos[base + off].p;
+                    }
+                }
+                outer.diskSave(r.victimPid, r.victimPage, dump);   // usa HashMap já existente no Sistema
+                hw.cpu.raiseDiskPageSaved(r.frame);                // interrupção “salvou, quadro liberado”
+            } else { // LOAD
+                PCB cur = gp.getPCB(r.pid);
+                if (cur == null) {
+                    // processo terminou/foi removido; ignore este LOAD
+                    continue;
+                }
+
+                Word[] image = progs.retrieveProgram(cur.name);
+                int tamProg  = cur.tamProg;
+
+                int baseProg = r.page  * tamPg;
+                int baseFis  = r.frame * tamPg;
+
+                synchronized (hw.mem) {
+                    // carrega IMAGEM da página
+                    for (int off = 0; off < tamPg; off++) {
+                        int idx = baseProg + off;
+                        if (image != null && idx < tamProg) {
+                            Word w = image[idx];
+                            hw.mem.pos[baseFis + off].opc = w.opc;
+                            hw.mem.pos[baseFis + off].ra  = w.ra;
+                            hw.mem.pos[baseFis + off].rb  = w.rb;
+                            hw.mem.pos[baseFis + off].p   = w.p;
+                        } else {
+                            hw.mem.pos[baseFis + off].opc = Opcode.DATA;
+                            hw.mem.pos[baseFis + off].ra  = -1;
+                            hw.mem.pos[baseFis + off].rb  = -1;
+                            hw.mem.pos[baseFis + off].p   = -1;
+                        }
+                    }
+                    // re-aplica DUMP (se houver)
+                    int[] dump = outer.diskLoad(r.pid, r.page);
+                    if (dump != null) {
+                        for (int off = 0; off < tamPg; off++) {
+                            hw.mem.pos[baseFis + off].p = dump[off];
+                        }
+                    }
+                }
+
+                hw.cpu.raiseDiskPageLoaded(r.pid, r.page, r.frame); // interrupção “página carregada”
             }
+        } catch (InterruptedException e) {
+            break;
         }
-        return 0;
     }
 }
 
+		}
 
 }
